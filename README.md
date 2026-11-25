@@ -2,6 +2,7 @@
 
 A Windows-friendly Python GUI for viewing Star Citizen telemetry and tracking
 a player position on VerseGuide surface maps.
+<img width="1008" height="887" alt="image" src="https://github.com/user-attachments/assets/53a04a5b-da1e-4347-9262-172ee692fc7a" />
 
 ## Features
 
