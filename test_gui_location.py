@@ -14,6 +14,7 @@ from gui import (
     decode_showlocation,
     gauge_percentage,
     parse_frame,
+    validate_route_document,
 )
 
 
@@ -393,6 +394,286 @@ class MapResolutionTests(unittest.TestCase):
         image = TelemetryWindow._scaled_map_image(window)
 
         self.assertIs(image, source_image)
+
+
+class MapWindowControlTests(unittest.TestCase):
+    def test_map_window_visibility_topmost_and_opacity_controls(self):
+        class FakeWindow:
+            def __init__(self):
+                self.actions = []
+
+            def deiconify(self):
+                self.actions.append(("deiconify",))
+
+            def lift(self):
+                self.actions.append(("lift",))
+
+            def withdraw(self):
+                self.actions.append(("withdraw",))
+
+            def attributes(self, *args):
+                self.actions.append(args)
+
+        labels = []
+        window = SimpleNamespace(
+            map_window=FakeWindow(),
+            map_topmost=SimpleNamespace(get=lambda: True),
+            map_opacity_label=SimpleNamespace(set=labels.append),
+        )
+
+        TelemetryWindow._show_map_window(window)
+        TelemetryWindow._hide_map_window(window)
+        TelemetryWindow._toggle_map_topmost(window)
+        TelemetryWindow._set_map_opacity(window, "0.5")
+        TelemetryWindow._set_map_opacity(window, "0.1")
+
+        self.assertEqual(
+            window.map_window.actions,
+            [
+                ("deiconify",),
+                ("lift",),
+                ("withdraw",),
+                ("-topmost", True),
+                ("-alpha", 0.5),
+                ("-alpha", 0.35),
+            ],
+        )
+        self.assertEqual(labels, ["50%", "35%"])
+
+
+class RouteEditingTests(unittest.TestCase):
+    def test_route_document_round_trips_valid_body_and_coordinates(self):
+        body_code, points = validate_route_document(
+            {
+                "version": 1,
+                "body": {"system": "STANTON", "code": "I"},
+                "points": [
+                    {"name": "Camp", "latitude": 12.5, "longitude": -45},
+                    {"latitude": -90, "longitude": 180},
+                ],
+            }
+        )
+
+        self.assertEqual(body_code, ("STANTON", "I"))
+        self.assertEqual(
+            points,
+            [
+                {"name": "Camp", "latitude": 12.5, "longitude": -45.0},
+                {"name": "Point 2", "latitude": -90.0, "longitude": 180.0},
+            ],
+        )
+
+    def test_route_document_rejects_invalid_coordinates_and_versions(self):
+        for document in (
+            {
+                "version": 1,
+                "body": {"system": "STANTON", "code": "I"},
+                "points": [{"latitude": 91, "longitude": 0}],
+            },
+            {
+                "version": 1,
+                "body": {"system": "STANTON", "code": "I"},
+                "points": [{"latitude": True, "longitude": 0}],
+            },
+            {
+                "version": 1,
+                "body": {"system": "STANTON", "code": "I"},
+                "points": [{"latitude": 10**1000, "longitude": 0}],
+            },
+            {
+                "version": 1,
+                "body": {"system": "STANTON", "code": "I"},
+                "points": [{"name": 4, "latitude": 0, "longitude": 0}],
+            },
+            {
+                "version": 2,
+                "body": {"system": "STANTON", "code": "I"},
+                "points": [],
+            },
+            {
+                "version": True,
+                "body": {"system": "STANTON", "code": "I"},
+                "points": [],
+            },
+        ):
+            with self.subTest(document=document):
+                with self.assertRaises(ValueError):
+                    validate_route_document(document)
+
+    def test_map_coordinate_conversion_round_trips(self):
+        class FakeImage:
+            def width(self):
+                return 3600
+
+            def height(self):
+                return 1800
+
+        window = SimpleNamespace(
+            map_image=FakeImage(),
+            map_offset=(-725, -210),
+        )
+        latitude, longitude = 34.25, -127.75
+        x = window.map_offset[0] + (longitude + 180) / 360 * window.map_image.width()
+        y = window.map_offset[1] + (90 - latitude) / 180 * window.map_image.height()
+
+        actual = TelemetryWindow._map_coordinates_at(window, x, y)
+
+        self.assertAlmostEqual(actual[0], latitude)
+        self.assertAlmostEqual(actual[1], longitude)
+
+    def test_dragging_route_point_updates_its_surface_coordinates(self):
+        class FakeImage:
+            def width(self):
+                return 3600
+
+            def height(self):
+                return 1800
+
+        window = SimpleNamespace(
+            route_drag_index=0,
+            route_points=[{"name": "Start", "latitude": 0.0, "longitude": 0.0}],
+            map_image=FakeImage(),
+            map_offset=(0, 0),
+            _map_coordinates_at=lambda x, y: TelemetryWindow._map_coordinates_at(
+                window, x, y
+            ),
+            _refresh_route_list=lambda: None,
+            _render_map=lambda: None,
+        )
+        event = SimpleNamespace(x=1800, y=450)
+
+        result = TelemetryWindow._pan_map(window, event)
+
+        self.assertEqual(result, "break")
+        self.assertEqual(window.route_points[0]["latitude"], 45)
+        self.assertEqual(window.route_points[0]["longitude"], 0)
+        self.assertEqual(window.route_points[0]["name"], "Start")
+
+    def test_new_route_points_keep_entered_names_or_get_a_default_name(self):
+        class FakeVariable:
+            def set(self, value):
+                self.value = value
+
+        window = SimpleNamespace(
+            map_body_code=("STANTON", "2B"),
+            route_body_code=None,
+            route_points=[],
+            selected_route_point=None,
+            route_status=FakeVariable(),
+            _refresh_route_list=lambda: None,
+            _render_map=lambda: None,
+        )
+
+        TelemetryWindow._add_route_point(window, 10, 20, name="  Start ")
+        TelemetryWindow._add_route_point(window, 30, 40)
+
+        self.assertEqual(
+            [point["name"] for point in window.route_points],
+            ["Start", "Point 2"],
+        )
+
+    def test_selected_route_point_can_be_renamed(self):
+        class FakeVariable:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        window = SimpleNamespace(
+            selected_route_point=0,
+            route_points=[
+                {"name": "Old name", "latitude": 12.0, "longitude": 34.0}
+            ],
+            route_name=FakeVariable("New name"),
+            route_status=FakeVariable(""),
+            _route_coordinates_from_fields=lambda: (12.0, 34.0),
+            _refresh_route_list=lambda: None,
+            _render_map=lambda: None,
+        )
+
+        TelemetryWindow._update_selected_route_point(window)
+
+        self.assertEqual(window.route_points[0]["name"], "New name")
+
+    def test_selected_route_point_can_be_reordered(self):
+        class FakeVariable:
+            def set(self, value):
+                self.value = value
+
+        window = SimpleNamespace(
+            selected_route_point=1,
+            route_points=[
+                {"name": "Start", "latitude": 0, "longitude": 0},
+                {"name": "Turn", "latitude": 1, "longitude": 1},
+                {"name": "Finish", "latitude": 2, "longitude": 2},
+            ],
+            route_status=FakeVariable(),
+            _refresh_route_list=lambda: None,
+            _render_map=lambda: None,
+        )
+
+        TelemetryWindow._move_route_point(window, -1)
+
+        self.assertEqual(
+            [point["name"] for point in window.route_points],
+            ["Turn", "Start", "Finish"],
+        )
+        self.assertEqual(window.selected_route_point, 0)
+
+        TelemetryWindow._move_route_point(window, -1)
+        self.assertEqual(
+            [point["name"] for point in window.route_points],
+            ["Turn", "Start", "Finish"],
+        )
+
+    def test_route_can_be_saved_and_loaded_as_json(self):
+        class FakeVariable:
+            def set(self, value):
+                self.value = value
+
+        with tempfile.TemporaryDirectory() as directory:
+            route_path = Path(directory) / "route.json"
+            window = SimpleNamespace(
+                route_body_code=("STANTON", "I"),
+                route_points=[
+                    {"name": "Start", "latitude": 12.5, "longitude": -45.0}
+                ],
+                selected_route_point=0,
+                root=None,
+                route_status=FakeVariable(),
+                bodies={"systems": {"STANTON": {"I": {}}}},
+                _refresh_route_list=lambda: None,
+                _render_map=lambda: None,
+            )
+            with patch(
+                "gui.filedialog.asksaveasfilename", return_value=str(route_path)
+            ):
+                TelemetryWindow._save_route(window)
+
+            saved = json.loads(route_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["version"], 1)
+            self.assertEqual(saved["body"], {"system": "STANTON", "code": "I"})
+            self.assertEqual(
+                saved["points"],
+                [{"name": "Start", "latitude": 12.5, "longitude": -45.0}],
+            )
+
+            window.route_points = []
+            window.route_body_code = None
+            with patch(
+                "gui.filedialog.askopenfilename", return_value=str(route_path)
+            ):
+                TelemetryWindow._load_route(window)
+
+        self.assertEqual(window.route_body_code, ("STANTON", "I"))
+        self.assertEqual(
+            window.route_points,
+            [{"name": "Start", "latitude": 12.5, "longitude": -45.0}],
+        )
 
 
 class MapLicenseLinkTests(unittest.TestCase):

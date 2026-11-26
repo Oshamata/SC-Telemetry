@@ -9,7 +9,11 @@ a player position on VerseGuide surface maps.
 - Displays vehicle instruments and health, oxygen, food, and hydration gauges.
 - Accepts `/showlocation` coordinates and can monitor the clipboard for them.
 - Shows the player marker as a heading-oriented arrow on a downloaded surface map.
+- Opens the surface map in a separate window with always-on-top and opacity
+  controls.
 - Supports map zooming, panning, player-follow mode, and choosing cached maps.
+- Draws editable surface routes by placing points on the map or entering
+  latitude/longitude coordinates, and saves or loads routes as JSON.
 - Estimates surface movement from telemetry speed and heading between location
   fixes. This estimate can drift, especially during free-space or sideways
   flight; altitude remains the value from the last `/showlocation` fix.
@@ -59,11 +63,28 @@ later. To track a position, copy `/showlocation` in-game, then paste its
 `Coordinates:` line into the location field or leave it on the clipboard for
 the GUI to detect.
 
-Use **Load VerseGuide surface map** to download a map. Downloaded maps are
-cached under `%LOCALAPPDATA%\StarCitizenTelemetryServerExample\maps`. Disable
-**Follow player** to pan independently and choose among cached maps from the
-dropdown at the upper-right of the map. When a map is displayed, the link below
-it opens the VerseGuide map-data MIT license.
+The map opens in its own window. Use **Load VerseGuide surface map** there to
+download a map. Downloaded maps are cached under
+`%LOCALAPPDATA%\StarCitizenTelemetryServerExample\maps`. Disable **Follow
+player** to pan independently and choose among cached maps from the dropdown
+at the upper-right of the map. **Always on top** keeps the map above other
+windows; use the **Opacity** slider to make the entire map window more
+transparent. Close the map window to hide it, then use **Show map window** in
+the main window to reopen it. When a map is displayed, the link below it opens
+the VerseGuide map-data MIT license.
+
+To create a route, load the matching surface map, then use **Place on map** and
+click to add points, or enter latitude and longitude and choose **Add point**.
+Name each point in the **Name** field. Select a point in the list to edit its
+name or coordinates, remove it, or use **Move up**/**Move down** to change the
+route order. Drag a point on the map to move it. **Save route** and **Load
+route** use a versioned JSON format that stores the route's Star System/body
+code, point names, coordinates, and order. Routes are displayed only on the
+matching body's map.
+
+An example Daymar route is available at
+[`data/daymar_rally_example.json`](data/daymar_rally_example.json). Load it with
+**Load route** while Daymar's surface map is selected.
 
 ## Tests
 

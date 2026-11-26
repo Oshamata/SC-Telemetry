@@ -17,7 +17,7 @@ import webbrowser
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import grpc
 
@@ -41,6 +41,61 @@ MIN_MAP_ZOOM_LEVEL = 0
 MAX_MAP_ZOOM_LEVEL = 3
 UNKNOWN_BODY_ERROR = "Coordinates do not match a known VerseGuide planet or moon"
 UNKNOWN_BODY_MAP_MESSAGE = "Not on a known planet/moon."
+ROUTE_FORMAT_VERSION = 1
+
+
+def validate_route_document(document):
+    if (
+        not isinstance(document, dict)
+        or type(document.get("version")) is not int
+        or document["version"] != ROUTE_FORMAT_VERSION
+    ):
+        raise ValueError("Unsupported or invalid route file.")
+    body = document.get("body")
+    points = document.get("points")
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("system"), str)
+        or not body["system"]
+        or not isinstance(body.get("code"), str)
+        or not body["code"]
+        or not isinstance(points, list)
+    ):
+        raise ValueError("Route file must include a body and a list of points.")
+
+    validated_points = []
+    for index, point in enumerate(points, start=1):
+        if not isinstance(point, dict):
+            raise ValueError(f"Route point {index} must be an object.")
+        latitude = point.get("latitude")
+        longitude = point.get("longitude")
+        if (
+            isinstance(latitude, bool)
+            or isinstance(longitude, bool)
+            or not isinstance(latitude, (int, float))
+            or not isinstance(longitude, (int, float))
+        ):
+            raise ValueError(f"Route point {index} has invalid coordinates.")
+        try:
+            latitude = float(latitude)
+            longitude = float(longitude)
+        except (OverflowError, ValueError):
+            raise ValueError(f"Route point {index} has invalid coordinates.") from None
+        if (
+            not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not -90 <= latitude <= 90
+            or not -180 <= longitude <= 180
+        ):
+            raise ValueError(f"Route point {index} has invalid coordinates.")
+        name = point.get("name", f"Point {index}")
+        if not isinstance(name, str):
+            raise ValueError(f"Route point {index} has an invalid name.")
+        name = name.strip() or f"Point {index}"
+        validated_points.append(
+            {"name": name, "latitude": latitude, "longitude": longitude}
+        )
+    return (body["system"], body["code"]), validated_points
 
 
 def varint(data, offset):
@@ -347,8 +402,8 @@ class TelemetryWindow:
     def __init__(self, root):
         self.root = root
         self.root.title("Star Citizen Telemetry")
-        self.root.geometry("1000x850")
-        self.root.minsize(800, 700)
+        self.root.geometry("1000x650")
+        self.root.minsize(800, 520)
 
         self.bodies = json.loads(BODY_DATA_PATH.read_text(encoding="utf-8"))
         self.messages = queue.Queue()
@@ -383,6 +438,13 @@ class TelemetryWindow:
         self.last_nav_timestamp = None
         self.location_is_estimated = False
         self.navigation_paused = False
+        self.route_points = []
+        self.route_body_code = None
+        self.selected_route_point = None
+        self.route_drag_index = None
+        self.place_route_point = False
+        self.map_opacity = tk.DoubleVar(value=1.0)
+        self.map_topmost = tk.BooleanVar(value=False)
 
         style = ttk.Style()
         style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"))
@@ -441,26 +503,62 @@ class TelemetryWindow:
 
         map_row = ttk.Frame(location_group)
         map_row.pack(fill="x", pady=(0, 4))
-        self.load_map_button = ttk.Button(
-            map_row, text="Load VerseGuide surface map", command=self._load_surface_map
-        )
-        self.load_map_button.pack(side="left")
+        ttk.Button(
+            map_row, text="Show map window", command=self._show_map_window
+        ).pack(side="left")
         ttk.Label(map_row, textvariable=self.map_status).pack(
             side="left", padx=8, fill="x", expand=True
         )
-        ttk.Button(map_row, text="Reset view", command=self._reset_map_view).pack(
+
+        self.map_window = tk.Toplevel(root)
+        self.map_window.title("Star Citizen Surface Map")
+        self.map_window.geometry("1200x760")
+        self.map_window.minsize(640, 450)
+        self.map_window.protocol("WM_DELETE_WINDOW", self._hide_map_window)
+        map_controls = ttk.Frame(self.map_window, padding=(8, 6))
+        map_controls.pack(fill="x")
+        self.load_map_button = ttk.Button(
+            map_controls,
+            text="Load VerseGuide surface map",
+            command=self._load_surface_map,
+        )
+        self.load_map_button.pack(side="left")
+        ttk.Label(map_controls, textvariable=self.map_status).pack(
+            side="left", padx=8, fill="x", expand=True
+        )
+        ttk.Button(map_controls, text="Reset view", command=self._reset_map_view).pack(
             side="right"
         )
-        ttk.Label(map_row, text="Scroll to zoom; uncheck Follow to pan").pack(
+        ttk.Label(map_controls, text="Scroll to zoom; uncheck Follow to pan").pack(
             side="right", padx=8
         )
         ttk.Checkbutton(
-            map_row,
+            map_controls,
             text="Follow player",
             variable=self.follow_player,
             command=self._toggle_map_follow,
         ).pack(side="right", padx=8)
-        map_view = ttk.Frame(location_group)
+        ttk.Checkbutton(
+            map_controls,
+            text="Always on top",
+            variable=self.map_topmost,
+            command=self._toggle_map_topmost,
+        ).pack(side="right", padx=8)
+        ttk.Label(map_controls, text="Opacity").pack(side="right", padx=(8, 2))
+        self.map_opacity_label = tk.StringVar(value="100%")
+        ttk.Label(map_controls, textvariable=self.map_opacity_label, width=4).pack(
+            side="right"
+        )
+        ttk.Scale(
+            map_controls,
+            from_=0.35,
+            to=1.0,
+            orient="horizontal",
+            variable=self.map_opacity,
+            command=self._set_map_opacity,
+            length=120,
+        ).pack(side="right", padx=(2, 0))
+        map_view = ttk.Frame(self.map_window)
         map_view.pack(fill="both", expand=True)
         self.map_canvas = tk.Canvas(
             map_view, height=350, background="#101820", highlightthickness=0
@@ -468,8 +566,12 @@ class TelemetryWindow:
         self.map_canvas.pack(fill="both", expand=True)
         self.map_canvas.bind("<Configure>", self._draw_map)
         self.map_canvas.bind("<MouseWheel>", self._on_map_wheel)
-        self.map_canvas.bind("<Button-4>", lambda event: self._zoom_map(1, event.x, event.y))
-        self.map_canvas.bind("<Button-5>", lambda event: self._zoom_map(-1, event.x, event.y))
+        self.map_canvas.bind(
+            "<Button-4>", lambda event: self._zoom_map(1, event.x, event.y)
+        )
+        self.map_canvas.bind(
+            "<Button-5>", lambda event: self._zoom_map(-1, event.x, event.y)
+        )
         self.map_canvas.bind("<ButtonPress-1>", self._start_map_pan)
         self.map_canvas.bind("<B1-Motion>", self._pan_map)
         self.map_canvas.bind("<ButtonRelease-1>", self._stop_map_pan)
@@ -489,14 +591,83 @@ class TelemetryWindow:
         self._update_map_selector_visibility()
         self._draw_redownload_map_button()
         self.map_license_link = ttk.Label(
-            location_group,
+            self.map_window,
             text="VerseGuide map data license (MIT)",
             foreground="#0563c1",
             cursor="hand2",
         )
         self.map_license_link.bind("<Button-1>", self._open_verseguide_license)
-        self.map_license_link.pack(anchor="w", pady=(2, 0))
+        self.map_license_link.pack(anchor="w", padx=8, pady=(2, 6))
         self.map_license_link.pack_forget()
+        route_controls = ttk.Frame(location_group)
+        route_fields = ttk.Frame(location_group)
+        route_fields.pack(fill="x", pady=(0, 4))
+        ttk.Label(route_fields, text="Name:").pack(side="left")
+        self.route_name = tk.StringVar()
+        ttk.Entry(route_fields, textvariable=self.route_name, width=24).pack(
+            side="left", padx=(3, 10)
+        )
+        ttk.Label(route_fields, text="Lat:").pack(side="left")
+        self.route_latitude = tk.StringVar()
+        ttk.Entry(route_fields, textvariable=self.route_latitude, width=11).pack(
+            side="left", padx=(3, 10)
+        )
+        ttk.Label(route_fields, text="Lon:").pack(side="left")
+        self.route_longitude = tk.StringVar()
+        ttk.Entry(route_fields, textvariable=self.route_longitude, width=11).pack(
+            side="left", padx=(3, 8)
+        )
+        route_controls.pack(fill="x", pady=(0, 4))
+        self.route_status = tk.StringVar(value="No route points.")
+        self.place_route_button = ttk.Button(
+            route_controls,
+            text="Place on map",
+            command=self._toggle_route_placement,
+        )
+        self.place_route_button.pack(side="left", padx=(0, 4))
+        ttk.Button(
+            route_controls, text="Add point", command=self._add_route_point_from_fields
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            route_controls,
+            text="Update selected",
+            command=self._update_selected_route_point,
+        ).pack(side="left", padx=4)
+        ttk.Button(
+            route_controls, text="Remove point", command=self._remove_route_point
+        ).pack(side="left", padx=4)
+        ttk.Button(route_controls, text="Load route", command=self._load_route).pack(
+            side="right", padx=(4, 0)
+        )
+        ttk.Button(route_controls, text="Save route", command=self._save_route).pack(
+            side="right"
+        )
+        route_list_frame = ttk.Frame(location_group)
+        route_list_frame.pack(fill="x", pady=(0, 4))
+        route_order_buttons = ttk.Frame(route_list_frame)
+        route_order_buttons.pack(side="left", fill="y", padx=(0, 6))
+        self.route_move_up_button = ttk.Button(
+            route_order_buttons,
+            text="Move up",
+            state="disabled",
+            command=lambda: self._move_route_point(-1),
+        )
+        self.route_move_up_button.pack(fill="x", pady=(0, 2))
+        self.route_move_down_button = ttk.Button(
+            route_order_buttons,
+            text="Move down",
+            state="disabled",
+            command=lambda: self._move_route_point(1),
+        )
+        self.route_move_down_button.pack(fill="x")
+        self.route_list = tk.Listbox(
+            route_list_frame, height=3, exportselection=False
+        )
+        self.route_list.pack(side="left", fill="x", expand=True)
+        self.route_list.bind("<<ListboxSelect>>", self._on_route_point_selected)
+        ttk.Label(location_group, textvariable=self.route_status).pack(
+            anchor="w", pady=(0, 4)
+        )
 
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(100, self._process_messages)
@@ -610,6 +781,21 @@ class TelemetryWindow:
             f"{'E' if fix['longitude'] >= 0 else 'W'}  |  "
             f"alt at fix {fix['altitude']:,.0f} m  |  {source}"
         )
+
+    def _show_map_window(self):
+        self.map_window.deiconify()
+        self.map_window.lift()
+
+    def _hide_map_window(self):
+        self.map_window.withdraw()
+
+    def _toggle_map_topmost(self):
+        self.map_window.attributes("-topmost", self.map_topmost.get())
+
+    def _set_map_opacity(self, value):
+        opacity = max(0.35, min(1.0, float(value)))
+        self.map_opacity_label.set(f"{opacity:.0%}")
+        self.map_window.attributes("-alpha", opacity)
 
     def _map_cache_path(self, body_name):
         local_app_data = os.environ.get(
@@ -913,8 +1099,327 @@ class TelemetryWindow:
             self._draw_redownload_map_button()
             return
         self._position_map_tiles()
+        self._draw_route()
         self._update_map_marker()
         self._draw_redownload_map_button()
+
+    def _toggle_route_placement(self):
+        if self.map_image is None or self.map_body_code is None:
+            self.route_status.set("Load a surface map before placing route points.")
+            return
+        self.place_route_point = not self.place_route_point
+        self.place_route_button.configure(
+            text="Cancel placement" if self.place_route_point else "Place on map"
+        )
+        self.route_status.set(
+            "Click the map to add a point."
+            if self.place_route_point
+            else "Map placement cancelled."
+        )
+
+    def _route_coordinates_from_fields(self):
+        try:
+            latitude = float(self.route_latitude.get())
+            longitude = float(self.route_longitude.get())
+        except ValueError:
+            messagebox.showerror(
+                "Invalid coordinates",
+                "Enter numeric latitude and longitude values.",
+                parent=self.root,
+            )
+            return None
+        if (
+            not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not -90 <= latitude <= 90
+            or not -180 <= longitude <= 180
+        ):
+            messagebox.showerror(
+                "Invalid coordinates",
+                "Latitude must be between -90 and 90; longitude must be "
+                "between -180 and 180.",
+                parent=self.root,
+            )
+            return None
+        return latitude, longitude
+
+    def _add_route_point_from_fields(self):
+        coordinates = self._route_coordinates_from_fields()
+        if coordinates is not None:
+            self._add_route_point(*coordinates, name=self.route_name.get())
+
+    def _add_route_point(self, latitude, longitude, name=None):
+        if self.map_body_code is None:
+            self.route_status.set("Load or select a surface map before adding points.")
+            return
+        if self.route_body_code not in (None, self.map_body_code):
+            self.route_status.set(
+                "This route belongs to another body. Load its map to continue editing."
+            )
+            return
+        self.route_body_code = self.map_body_code
+        point_name = name.strip() if isinstance(name, str) else ""
+        if not point_name:
+            point_name = f"Point {len(self.route_points) + 1}"
+        self.route_points.append(
+            {
+                "name": point_name,
+                "latitude": latitude,
+                "longitude": longitude,
+            }
+        )
+        self.selected_route_point = len(self.route_points) - 1
+        self._refresh_route_list()
+        self._render_map()
+        self.route_status.set(f"Added route point {len(self.route_points)}.")
+
+    def _refresh_route_list(self):
+        self.route_list.delete(0, "end")
+        for index, point in enumerate(self.route_points, start=1):
+            self.route_list.insert(
+                "end",
+                f"{index}: {point['name']} "
+                f"({point['latitude']:.6f}, {point['longitude']:.6f})",
+            )
+        if self.selected_route_point is not None and self.route_points:
+            self.selected_route_point = min(
+                self.selected_route_point, len(self.route_points) - 1
+            )
+            self.route_list.selection_set(self.selected_route_point)
+            self.route_list.see(self.selected_route_point)
+            point = self.route_points[self.selected_route_point]
+            self.route_name.set(point["name"])
+            self.route_latitude.set(f"{point['latitude']:.6f}")
+            self.route_longitude.set(f"{point['longitude']:.6f}")
+            self.route_move_up_button.configure(
+                state="normal" if self.selected_route_point > 0 else "disabled"
+            )
+            self.route_move_down_button.configure(
+                state=(
+                    "normal"
+                    if self.selected_route_point < len(self.route_points) - 1
+                    else "disabled"
+                )
+            )
+        else:
+            self.selected_route_point = None
+            self.route_name.set("")
+            self.route_latitude.set("")
+            self.route_longitude.set("")
+            self.route_move_up_button.configure(state="disabled")
+            self.route_move_down_button.configure(state="disabled")
+
+    def _on_route_point_selected(self, _event=None):
+        selection = self.route_list.curselection()
+        if not selection:
+            return
+        self.selected_route_point = selection[0]
+        point = self.route_points[self.selected_route_point]
+        self.route_name.set(point["name"])
+        self.route_latitude.set(f"{point['latitude']:.6f}")
+        self.route_longitude.set(f"{point['longitude']:.6f}")
+        self.route_move_up_button.configure(
+            state="normal" if self.selected_route_point > 0 else "disabled"
+        )
+        self.route_move_down_button.configure(
+            state=(
+                "normal"
+                if self.selected_route_point < len(self.route_points) - 1
+                else "disabled"
+            )
+        )
+        self._render_map()
+
+    def _move_route_point(self, direction):
+        if self.selected_route_point is None:
+            self.route_status.set("Select a route point to move.")
+            return
+        destination = self.selected_route_point + direction
+        if not 0 <= destination < len(self.route_points):
+            return
+        self.route_points[self.selected_route_point], self.route_points[destination] = (
+            self.route_points[destination],
+            self.route_points[self.selected_route_point],
+        )
+        self.selected_route_point = destination
+        self._refresh_route_list()
+        self._render_map()
+        self.route_status.set(
+            f"Moved route point to position {destination + 1}."
+        )
+
+    def _update_selected_route_point(self):
+        if self.selected_route_point is None:
+            self.route_status.set("Select a route point to update.")
+            return
+        coordinates = self._route_coordinates_from_fields()
+        if coordinates is None:
+            return
+        latitude, longitude = coordinates
+        name = self.route_name.get().strip()
+        if not name:
+            name = f"Point {self.selected_route_point + 1}"
+        self.route_points[self.selected_route_point].update(
+            {"name": name, "latitude": latitude, "longitude": longitude}
+        )
+        self._refresh_route_list()
+        self._render_map()
+        self.route_status.set("Updated selected route point.")
+
+    def _remove_route_point(self):
+        if self.selected_route_point is None:
+            self.route_status.set("Select a route point to remove.")
+            return
+        del self.route_points[self.selected_route_point]
+        if not self.route_points:
+            self.route_body_code = None
+        self.selected_route_point = min(
+            self.selected_route_point, len(self.route_points) - 1
+        ) if self.route_points else None
+        self._refresh_route_list()
+        self._render_map()
+        self.route_status.set("Removed selected route point.")
+
+    def _save_route(self):
+        if self.route_body_code is None or not self.route_points:
+            self.route_status.set("Add at least one route point before saving.")
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Save route",
+            defaultextension=".json",
+            filetypes=(("JSON route", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        document = {
+            "version": ROUTE_FORMAT_VERSION,
+            "body": {
+                "system": self.route_body_code[0],
+                "code": self.route_body_code[1],
+            },
+            "points": self.route_points,
+        }
+        try:
+            Path(path).write_text(
+                json.dumps(document, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError as error:
+            messagebox.showerror(
+                "Could not save route",
+                f"The route file could not be saved: {error}",
+                parent=self.root,
+            )
+            return
+        self.route_status.set(f"Saved route to {path}.")
+
+    def _load_route(self):
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="Load route",
+            filetypes=(("JSON route", "*.json"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            document = json.loads(Path(path).read_text(encoding="utf-8"))
+            body_code, points = validate_route_document(document)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            messagebox.showerror(
+                "Could not load route",
+                f"The route file is invalid or could not be read: {error}",
+                parent=self.root,
+            )
+            return
+        systems = self.bodies["systems"]
+        if body_code[1] not in systems.get(body_code[0], {}):
+            messagebox.showerror(
+                "Could not load route",
+                "The route references a planet or moon not present in the map data.",
+                parent=self.root,
+            )
+            return
+        self.route_body_code = body_code if points else None
+        self.route_points = points
+        self.selected_route_point = 0 if points else None
+        self._refresh_route_list()
+        self._render_map()
+        self.route_status.set(
+            f"Loaded {len(points)} point(s). Select {body_code[0]}/{body_code[1]} "
+            "to view and edit this route."
+        )
+
+    def _route_canvas_position(self, index, reference_x=None):
+        point = self.route_points[index]
+        image_width = self.map_image.width()
+        image_height = self.map_image.height()
+        x = self.map_offset[0] + (point["longitude"] + 180) / 360 * image_width
+        y = self.map_offset[1] + (90 - point["latitude"]) / 180 * image_height
+        reference_x = (
+            self.map_canvas.winfo_width() / 2
+            if reference_x is None
+            else reference_x
+        )
+        x += round((reference_x - x) / image_width) * image_width
+        return x, y
+
+    def _map_coordinates_at(self, x, y):
+        image_width = self.map_image.width()
+        image_height = self.map_image.height()
+        map_x = (x - self.map_offset[0]) % image_width
+        map_y = y - self.map_offset[1]
+        latitude = max(-90.0, min(90.0, 90 - map_y / image_height * 180))
+        longitude = map_x / image_width * 360 - 180
+        return latitude, longitude
+
+    def _draw_route(self):
+        if (
+            not self.route_points
+            or self.map_image is None
+            or self.route_body_code != self.map_body_code
+        ):
+            return
+        image_width = self.map_image.width()
+        center_x = self.map_canvas.winfo_width() / 2
+        for first, second in zip(self.route_points, self.route_points[1:]):
+            x1 = self.map_offset[0] + (first["longitude"] + 180) / 360 * image_width
+            x2 = self.map_offset[0] + (second["longitude"] + 180) / 360 * image_width
+            delta_x = (x2 - x1 + image_width / 2) % image_width - image_width / 2
+            shift = round((center_x - (x1 + delta_x / 2)) / image_width)
+            y1 = self.map_offset[1] + (90 - first["latitude"]) / 180 * self.map_image.height()
+            y2 = self.map_offset[1] + (90 - second["latitude"]) / 180 * self.map_image.height()
+            for tile in (shift - 1, shift, shift + 1):
+                offset_x = tile * image_width
+                self.map_canvas.create_line(
+                    x1 + offset_x,
+                    y1,
+                    x1 + delta_x + offset_x,
+                    y2,
+                    fill="#36e08d",
+                    width=3,
+                    tags=("route",),
+                )
+        for index in range(len(self.route_points)):
+            x, y = self._route_canvas_position(index)
+            color = "#ffd34e" if index == self.selected_route_point else "#36e08d"
+            self.map_canvas.create_oval(
+                x - 7,
+                y - 7,
+                x + 7,
+                y + 7,
+                fill=color,
+                outline="white",
+                width=2,
+                tags=("route",),
+            )
+            self.map_canvas.create_text(
+                x,
+                y,
+                text=str(index + 1),
+                fill="#102018",
+                font=("Segoe UI", 8, "bold"),
+                tags=("route",),
+            )
 
     def _draw_redownload_map_button(self):
         tag = "redownload_map_button"
@@ -1051,6 +1556,39 @@ class TelemetryWindow:
         self._render_map()
 
     def _start_map_pan(self, event):
+        if self.place_route_point:
+            if self.map_image is not None and self.map_body_code is not None:
+                latitude, longitude = self._map_coordinates_at(event.x, event.y)
+                self._add_route_point(latitude, longitude)
+                self.place_route_point = False
+                self.place_route_button.configure(text="Place on map")
+            return "break"
+        if (
+            self.map_image is not None
+            and self.route_points
+            and self.route_body_code == self.map_body_code
+        ):
+            nearest = min(
+                (
+                    (
+                        (self._route_canvas_position(index, event.x)[0] - event.x) ** 2
+                        + (self._route_canvas_position(index, event.x)[1] - event.y) ** 2,
+                        index,
+                    )
+                    for index in range(len(self.route_points))
+                ),
+                default=(float("inf"), None),
+            )
+            if nearest[0] <= 12**2:
+                self.route_drag_index = nearest[1]
+                self.selected_route_point = nearest[1]
+                point = self.route_points[nearest[1]]
+                self.route_latitude.set(f"{point['latitude']:.6f}")
+                self.route_longitude.set(f"{point['longitude']:.6f}")
+                self._refresh_route_list()
+                self._render_map()
+                self.map_canvas.configure(cursor="fleur")
+                return "break"
         if self.map_image is None or self.follow_player.get():
             return "break"
         self.map_drag_origin = (event.x, event.y, *self.map_offset)
@@ -1058,6 +1596,14 @@ class TelemetryWindow:
         return "break"
 
     def _pan_map(self, event):
+        if self.route_drag_index is not None:
+            latitude, longitude = self._map_coordinates_at(event.x, event.y)
+            self.route_points[self.route_drag_index].update(
+                {"latitude": latitude, "longitude": longitude}
+            )
+            self._refresh_route_list()
+            self._render_map()
+            return "break"
         if self.map_drag_origin is None:
             return "break"
         start_x, start_y, offset_x, offset_y = self.map_drag_origin
@@ -1070,6 +1616,7 @@ class TelemetryWindow:
         return "break"
 
     def _stop_map_pan(self, _event=None):
+        self.route_drag_index = None
         self.map_drag_origin = None
         self.map_canvas.configure(cursor="")
         return "break"
