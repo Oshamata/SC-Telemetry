@@ -7,7 +7,9 @@ a player position on VerseGuide surface maps.
 ## Features
 
 - Connects to the local telemetry service at `127.0.0.1:2942`.
-- Displays vehicle instruments and health, oxygen, food, and hydration gauges.
+- Displays ship, heading, speed, and radar altitude as altitude, plus health,
+  oxygen, food, and hydration gauges. Vehicle telemetry can be collapsed, and
+  the main window scrolls when its contents do not fit.
 - Accepts `/showlocation` coordinates and can monitor the clipboard for them.
 - Shows the player marker as a heading-oriented arrow on a downloaded surface map.
 - Opens the surface map in a separate window with always-on-top and opacity

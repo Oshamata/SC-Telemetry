@@ -122,6 +122,21 @@ class PilotGaugeTests(unittest.TestCase):
         self.assertEqual(parsed["food"], (65.0, 100.0))
         self.assertEqual(parsed["hydration"], (40.0, 100.0))
 
+    def test_vehicle_altitude_uses_radar_altitude(self):
+        instruments = b"".join(
+            _encode_float(number, value)
+            for number, value in ((6, 1250), (7, 85), (8, -20))
+        )
+        flight = _encode_message(3, instruments)
+        vehicle_state = _encode_message(8, flight)
+        vehicle = _encode_message(3, _encode_message(2, vehicle_state))
+
+        parsed = parse_frame(vehicle)
+
+        self.assertEqual(parsed["altitude"], 85.0)
+        self.assertNotIn("radar_altitude", parsed)
+        self.assertNotIn("vertical_speed", parsed)
+
     def test_gauge_percentage_is_bounded_and_handles_missing_maximum(self):
         self.assertEqual(gauge_percentage((75, 100)), 75)
         self.assertEqual(gauge_percentage((125, 100)), 100)
@@ -720,7 +735,7 @@ class MapLicenseLinkTests(unittest.TestCase):
 
 
 class MapBoundaryTests(unittest.TestCase):
-    def test_vertical_offset_is_clamped_and_horizontal_tiles_cover_view(self):
+    def test_map_tiles_wrap_in_both_directions(self):
         class FakeCanvas:
             def winfo_width(self):
                 return 1000
@@ -741,21 +756,37 @@ class MapBoundaryTests(unittest.TestCase):
             map_offset=(-500, 0),
         )
 
-        self.assertEqual(
-            TelemetryWindow._clamp_map_offset(window, (25, 50)),
-            (25, 0),
-        )
-        self.assertEqual(
-            TelemetryWindow._clamp_map_offset(window, (25, -800)),
-            (25, -500),
-        )
-        positions = TelemetryWindow._horizontal_tile_positions(window)
-        self.assertEqual(positions, [-500, 1500, 3500])
-        self.assertLessEqual(positions[0], 0)
+        horizontal = TelemetryWindow._horizontal_tile_positions(window)
+        vertical = TelemetryWindow._vertical_tile_positions(window)
+        self.assertEqual(horizontal, [-500, 1500, 3500])
+        self.assertEqual(vertical, [-1000, 0, 1000])
         self.assertGreaterEqual(
-            positions[-1] + window.map_image.width(),
+            horizontal[-1] + window.map_image.width(),
             window.map_canvas.winfo_width(),
         )
+        self.assertGreaterEqual(
+            vertical[-1] + window.map_image.height(),
+            window.map_canvas.winfo_height(),
+        )
+
+    def test_map_panning_and_coordinate_selection_wrap_vertically(self):
+        window = SimpleNamespace(
+            route_drag_index=None,
+            map_drag_origin=(0, 0, 25, 50),
+            map_offset=(25, 50),
+            _render_map=lambda: None,
+            map_canvas=SimpleNamespace(
+                winfo_width=lambda: 1000,
+                winfo_height=lambda: 500,
+            ),
+            map_image=SimpleNamespace(width=lambda: 2000, height=lambda: 1000),
+        )
+
+        TelemetryWindow._pan_map(window, SimpleNamespace(x=0, y=1000))
+        coordinates = TelemetryWindow._map_coordinates_at(window, 25, 1100)
+
+        self.assertEqual(window.map_offset, (25, 1050))
+        self.assertEqual(coordinates, (81.0, -180.0))
 
 
 if __name__ == "__main__":

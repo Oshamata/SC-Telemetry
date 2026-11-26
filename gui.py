@@ -208,9 +208,7 @@ def parse_frame(frame):
     return {
         "ship": name.decode("utf-8", errors="replace") if name else None,
         "speed": float_value(instruments, 1),
-        "altitude": float_value(instruments, 6),
-        "radar_altitude": float_value(instruments, 7),
-        "vertical_speed": float_value(instruments, 8),
+        "altitude": float_value(instruments, 7),
         "heading": float_value(instruments, 10),
         "health": gauge_values(actor_vitals, 1),
         "oxygen": gauge_values(actor_vitals, 2),
@@ -451,8 +449,31 @@ class TelemetryWindow:
         style.configure("Value.TLabel", font=("Segoe UI", 16, "bold"))
         style.configure("Unit.TLabel", foreground="#666666")
 
-        container = ttk.Frame(root, padding=14)
-        container.pack(fill="both", expand=True)
+        scroll_area = ttk.Frame(root)
+        scroll_area.pack(fill="both", expand=True)
+        content_canvas = tk.Canvas(scroll_area, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(
+            scroll_area, orient="vertical", command=content_canvas.yview
+        )
+        content_canvas.configure(yscrollcommand=scrollbar.set)
+        content_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        container = ttk.Frame(content_canvas, padding=14)
+        content_window = content_canvas.create_window(
+            (0, 0), window=container, anchor="nw"
+        )
+        container.bind(
+            "<Configure>",
+            lambda _event: content_canvas.configure(
+                scrollregion=content_canvas.bbox("all")
+            ),
+        )
+        content_canvas.bind(
+            "<Configure>",
+            lambda event: content_canvas.itemconfigure(
+                content_window, width=event.width
+            ),
+        )
         ttk.Label(container, text="Star Citizen Telemetry", style="Title.TLabel").pack(
             anchor="w"
         )
@@ -469,11 +490,7 @@ class TelemetryWindow:
         )
         self.retry_button.pack(side="right")
 
-        self._add_group(
-            container,
-            "Vehicle",
-            ("Ship", "Speed", "Heading", "Altitude", "Radar altitude", "Vertical speed"),
-        )
+        self._add_vehicle_group(container)
         self._add_group(
             container,
             "On foot / pilot",
@@ -1080,7 +1097,6 @@ class TelemetryWindow:
         image_width = self.map_image.width()
         image_height = self.map_image.height()
         self.map_offset = ((width - image_width) / 2, (height - image_height) / 2)
-        self.map_offset = self._clamp_map_offset(self.map_offset)
         self._render_map()
 
     def _scaled_map_image(self):
@@ -1361,14 +1377,15 @@ class TelemetryWindow:
             else reference_x
         )
         x += round((reference_x - x) / image_width) * image_width
+        y += round((self.map_canvas.winfo_height() / 2 - y) / image_height) * image_height
         return x, y
 
     def _map_coordinates_at(self, x, y):
         image_width = self.map_image.width()
         image_height = self.map_image.height()
         map_x = (x - self.map_offset[0]) % image_width
-        map_y = y - self.map_offset[1]
-        latitude = max(-90.0, min(90.0, 90 - map_y / image_height * 180))
+        map_y = (y - self.map_offset[1]) % image_height
+        latitude = 90 - map_y / image_height * 180
         longitude = map_x / image_width * 360 - 180
         return latitude, longitude
 
@@ -1380,25 +1397,29 @@ class TelemetryWindow:
         ):
             return
         image_width = self.map_image.width()
+        image_height = self.map_image.height()
         center_x = self.map_canvas.winfo_width() / 2
+        center_y = self.map_canvas.winfo_height() / 2
         for first, second in zip(self.route_points, self.route_points[1:]):
             x1 = self.map_offset[0] + (first["longitude"] + 180) / 360 * image_width
             x2 = self.map_offset[0] + (second["longitude"] + 180) / 360 * image_width
             delta_x = (x2 - x1 + image_width / 2) % image_width - image_width / 2
-            shift = round((center_x - (x1 + delta_x / 2)) / image_width)
-            y1 = self.map_offset[1] + (90 - first["latitude"]) / 180 * self.map_image.height()
-            y2 = self.map_offset[1] + (90 - second["latitude"]) / 180 * self.map_image.height()
-            for tile in (shift - 1, shift, shift + 1):
-                offset_x = tile * image_width
-                self.map_canvas.create_line(
-                    x1 + offset_x,
-                    y1,
-                    x1 + delta_x + offset_x,
-                    y2,
-                    fill="#36e08d",
-                    width=3,
-                    tags=("route",),
-                )
+            shift_x = round((center_x - (x1 + delta_x / 2)) / image_width)
+            y1 = self.map_offset[1] + (90 - first["latitude"]) / 180 * image_height
+            y2 = self.map_offset[1] + (90 - second["latitude"]) / 180 * image_height
+            delta_y = (y2 - y1 + image_height / 2) % image_height - image_height / 2
+            shift_y = round((center_y - (y1 + delta_y / 2)) / image_height)
+            for tile_x in (shift_x - 1, shift_x, shift_x + 1):
+                for tile_y in (shift_y - 1, shift_y, shift_y + 1):
+                    self.map_canvas.create_line(
+                        x1 + tile_x * image_width,
+                        y1 + tile_y * image_height,
+                        x1 + delta_x + tile_x * image_width,
+                        y1 + tile_y * image_height + delta_y,
+                        fill="#36e08d",
+                        width=3,
+                        tags=("route",),
+                    )
         for index in range(len(self.route_points)):
             x, y = self._route_canvas_position(index)
             color = "#ffd34e" if index == self.selected_route_point else "#36e08d"
@@ -1483,30 +1504,36 @@ class TelemetryWindow:
             for index in range(tile_count)
         ]
 
+    def _vertical_tile_positions(self):
+        image_height = self.map_image.height()
+        canvas_height = self.map_canvas.winfo_height()
+        first_y = self.map_offset[1] % image_height - image_height
+        tile_count = math.ceil(canvas_height / image_height) + 2
+        return [
+            first_y + index * image_height
+            for index in range(tile_count)
+        ]
+
     def _position_map_tiles(self):
-        positions = self._horizontal_tile_positions()
-        offset_y = self.map_offset[1]
+        x_positions = self._horizontal_tile_positions()
+        y_positions = self._vertical_tile_positions()
+        positions = [
+            (x, y)
+            for y in y_positions
+            for x in x_positions
+        ]
         if len(positions) != len(self.map_image_ids):
             for image_id in self.map_image_ids:
                 self.map_canvas.delete(image_id)
             self.map_image_ids = [
                 self.map_canvas.create_image(
-                    x, offset_y, anchor="nw", image=self.map_image
+                    x, y, anchor="nw", image=self.map_image
                 )
-                for x in positions
+                for x, y in positions
             ]
             return
-        for image_id, x in zip(self.map_image_ids, positions):
-            self.map_canvas.coords(image_id, x, offset_y)
-
-    def _clamp_map_offset(self, offset):
-        image_height = self.map_image.height()
-        canvas_height = self.map_canvas.winfo_height()
-        if image_height <= canvas_height:
-            offset_y = (canvas_height - image_height) / 2
-        else:
-            offset_y = min(0, max(canvas_height - image_height, offset[1]))
-        return offset[0], offset_y
+        for image_id, (x, y) in zip(self.map_image_ids, positions):
+            self.map_canvas.coords(image_id, x, y)
 
     def _toggle_map_follow(self):
         self._update_map_selector_visibility()
@@ -1539,7 +1566,6 @@ class TelemetryWindow:
             x - relative_x * self.map_image.width(),
             y - relative_y * self.map_image.height(),
         )
-        self.map_offset = self._clamp_map_offset(self.map_offset)
         self._render_map()
         return "break"
 
@@ -1552,7 +1578,6 @@ class TelemetryWindow:
             (self.map_canvas.winfo_width() - self.map_image.width()) / 2,
             (self.map_canvas.winfo_height() - self.map_image.height()) / 2,
         )
-        self.map_offset = self._clamp_map_offset(self.map_offset)
         self._render_map()
 
     def _start_map_pan(self, event):
@@ -1611,7 +1636,6 @@ class TelemetryWindow:
             offset_x + event.x - start_x,
             offset_y + event.y - start_y,
         )
-        self.map_offset = self._clamp_map_offset(self.map_offset)
         self._render_map()
         return "break"
 
@@ -1639,7 +1663,6 @@ class TelemetryWindow:
             center_x = self.map_canvas.winfo_width() / 2
             center_y = self.map_canvas.winfo_height() / 2
             self.map_offset = (center_x - map_x, center_y - map_y)
-            self.map_offset = self._clamp_map_offset(self.map_offset)
             self._position_map_tiles()
         offset_x, offset_y = self.map_offset
         x = offset_x + map_x
@@ -1647,6 +1670,9 @@ class TelemetryWindow:
             (self.map_canvas.winfo_width() / 2 - x) / image_width
         ) * image_width
         y = offset_y + map_y
+        y += round(
+            (self.map_canvas.winfo_height() / 2 - y) / image_height
+        ) * image_height
         points = bearing_arrow_points(x, y, getattr(self, "current_heading", None))
         if self.map_marker_id is None:
             self.map_marker_id = self.map_canvas.create_polygon(
@@ -1674,6 +1700,47 @@ class TelemetryWindow:
                     anchor="w"
                 )
                 self.values[label] = value
+
+    def _add_vehicle_group(self, parent):
+        group = ttk.LabelFrame(parent, padding=8)
+        group.pack(fill="x", pady=6)
+        self.vehicle_expanded = True
+        self.vehicle_detail_cells = []
+        self.vehicle_toggle = ttk.Button(
+            group,
+            text="▼ Vehicle Telemetry",
+            command=self._toggle_vehicle_details,
+        )
+        self.vehicle_toggle.pack(anchor="w", fill="x")
+        fields = ttk.Frame(group)
+        fields.pack(fill="x", pady=(6, 0))
+
+        for index, label in enumerate(("Ship", "Heading", "Speed", "Altitude")):
+            row, column = divmod(index, 2)
+            cell = ttk.Frame(fields, padding=(4, 3))
+            cell.grid(row=row, column=column, sticky="ew", padx=4)
+            fields.columnconfigure(column, weight=1)
+            ttk.Label(cell, text=label, style="Unit.TLabel").pack(anchor="w")
+            value = tk.StringVar(value="--")
+            ttk.Label(cell, textvariable=value, style="Value.TLabel").pack(
+                anchor="w"
+            )
+            self.values[label] = value
+            if label not in ("Ship", "Heading"):
+                self.vehicle_detail_cells.append(cell)
+
+    def _toggle_vehicle_details(self):
+        self.vehicle_expanded = not self.vehicle_expanded
+        if self.vehicle_expanded:
+            for cell in self.vehicle_detail_cells:
+                cell.grid()
+        else:
+            for cell in self.vehicle_detail_cells:
+                cell.grid_remove()
+        self.vehicle_toggle.configure(
+            text=("▼" if self.vehicle_expanded else "▶")
+            + " Vehicle Telemetry"
+        )
 
     def _start_connection(self):
         if self.stop_event.is_set():
@@ -1818,8 +1885,6 @@ class TelemetryWindow:
         self.values["Heading"].set(display_number(data["heading"], "°"))
         self.current_heading = data["heading"]
         self.values["Altitude"].set(display_number(data["altitude"]))
-        self.values["Radar altitude"].set(display_number(data["radar_altitude"]))
-        self.values["Vertical speed"].set(display_number(data["vertical_speed"]))
         self.progress_bars["Health"].set_gauge(data["health"])
         self.progress_bars["Oxygen"].set_gauge(data["oxygen"])
         self.progress_bars["Food"].set_gauge(data["food"])
